@@ -18,6 +18,8 @@ const CONFIG = {
   BROWSER_AI: true,     // Real-ESRGAN dijalankan di HP/komputer pengguna (gratis, tanpa server)
   AI_MAX_PIXELS_GPU: 1200000, // batas foto masuk jika WebGPU tersedia (sekitar 1,2 MP)
   AI_MAX_PIXELS_CPU: 350000,  // batas foto masuk tanpa WebGPU (lebih lambat)
+  NATURAL_AI_WEIGHT: 0.7,     // gaya "Natural": 70% hasil AI + 30% foto asli
+  SHARPEN_MAX_PIXELS: 6500000, // di atas ini penajaman dilewati agar tidak kehabisan memori
   MAX_FILE_MB: 25,
   SHARPEN_AMOUNT: 0.8   // mempertegas detail tepi, tidak mengubah bentuk wajah
 };
@@ -47,7 +49,7 @@ if (!el.dlError) {
   el.dlError = p;
 }
 
-const state = { file: null, img: null, srcURL: null, outURL: null, scale: 2, busy: false };
+const state = { style: "natural", file: null, img: null, srcURL: null, outURL: null, scale: 2, busy: false };
 
 if (CONFIG.API_URL || CONFIG.BROWSER_AI) {
   el.modeBadge.textContent = CONFIG.API_URL ? "Real-ESRGAN (server)" : "Real-ESRGAN di perangkat";
@@ -156,6 +158,18 @@ document.querySelectorAll(".seg").forEach((btn) =>
       b.setAttribute("aria-checked", on);
     });
     updateHint();
+  })
+);
+
+/* ---------- Gaya hasil: Natural / Detail maksimal ---------- */
+document.querySelectorAll(".opt").forEach((btn) =>
+  btn.addEventListener("click", () => {
+    state.style = btn.dataset.style;
+    document.querySelectorAll(".opt").forEach((b) => {
+      const on = b === btn;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-checked", on);
+    });
   })
 );
 
@@ -306,6 +320,7 @@ function boxBlurRGB(s, w, h, r) {
 // Unsharp mask: abaikan beda sangat kecil (noise) dan batasi beda besar (halo).
 async function sharpen(canvas, amount, radius) {
   const w = canvas.width, h = canvas.height;
+  if (w * h > CONFIG.SHARPEN_MAX_PIXELS) return canvas; // hindari kehabisan memori di HP
   const ctx = canvas.getContext("2d");
   const frame = ctx.getImageData(0, 0, w, h);
   const d = frame.data, s = new Uint8ClampedArray(d);
@@ -475,6 +490,42 @@ async function aiUpscaleRGBA(src, sw, sh, runTile, onTile) {
   return out;
 }
 
+// Ubah ukuran bertahap (maks 2x per langkah) agar tepi tetap halus.
+function resizeSteps(src, w, h) {
+  let cur = src;
+  while (cur.width !== w || cur.height !== h) {
+    let nw = w, nh = h;
+    if (w > cur.width * 2) { nw = cur.width * 2; nh = cur.height * 2; }
+    else if (w < cur.width / 2) { nw = Math.round(cur.width / 2); nh = Math.round(cur.height / 2); }
+    const c = makeCanvas(nw, nh), ctx = c.getContext("2d");
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(cur, 0, 0, nw, nh);
+    cur = c;
+  }
+  return cur;
+}
+
+// Campur hasil AI dengan foto asli (per pita baris, hemat memori).
+// hasil = asli + bobotAI × (AI − asli)
+async function blendWithOriginal(canvas, base, aiWeight) {
+  const w = canvas.width, h = canvas.height;
+  const cx = canvas.getContext("2d"), bx = base.getContext("2d");
+  const BAND = Math.max(16, Math.floor(1500000 / w));
+  for (let y = 0, n = 0; y < h; y += BAND, n++) {
+    const bh = Math.min(BAND, h - y);
+    const a = cx.getImageData(0, y, w, bh), b = bx.getImageData(0, y, w, bh);
+    const ad = a.data, bd = b.data;
+    for (let i = 0; i < ad.length; i += 4) {
+      ad[i] = bd[i] + aiWeight * (ad[i] - bd[i]);
+      ad[i + 1] = bd[i + 1] + aiWeight * (ad[i + 1] - bd[i + 1]);
+      ad[i + 2] = bd[i + 2] + aiWeight * (ad[i + 2] - bd[i + 2]);
+    }
+    cx.putImageData(a, 0, y);
+    if (n % 4 === 3) await tick();
+  }
+}
+
 async function runAI(ai) {
   const sw = state.img.naturalWidth, sh = state.img.naturalHeight;
   const cap = ai.backend === "webgpu" ? CONFIG.AI_MAX_PIXELS_GPU : CONFIG.AI_MAX_PIXELS_CPU;
@@ -498,21 +549,23 @@ async function runAI(ai) {
     setProgress(14 + f * 76, "Real-ESRGAN memproses…")
   );
 
-  setProgress(92, "Menyusun hasil…");
+  setProgress(91, "Menyusun hasil…");
   await tick();
   const aw = sw * 4, ah = sh * 4;
-  const big = makeCanvas(aw, ah);
-  big.getContext("2d").putImageData(new ImageData(out, aw, ah), 0, 0);
+  let canvas = makeCanvas(aw, ah);
+  canvas.getContext("2d").putImageData(new ImageData(out, aw, ah), 0, 0);
 
   const { w, h } = targetSize();
-  let canvas = big;
-  if (w !== aw || h !== ah) {
-    canvas = makeCanvas(w, h);
-    const ctx = canvas.getContext("2d");
-    ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(big, 0, 0, w, h);
-    if (w > aw) canvas = await sharpen(canvas, 0.4, 2); // di atas 4x: sedikit penajaman
+  canvas = resizeSteps(canvas, w, h);
+
+  // Gaya Natural: campur dengan foto asli agar tampilan dan karakter wajah tetap terjaga.
+  const weight = state.style === "detail" ? 1 : CONFIG.NATURAL_AI_WEIGHT;
+  if (weight < 1) {
+    setProgress(94, "Menjaga kemiripan dengan foto asli…");
+    await tick();
+    await blendWithOriginal(canvas, resizeSteps(c0, w, h), weight);
   }
+  if (w > aw) canvas = await sharpen(canvas, 0.4, 2); // di atas 4x AI: sedikit penajaman
   setProgress(97, "Menyimpan hasil…");
   const outType = state.file.type === "image/jpeg" ? "image/jpeg" : "image/png";
   const blob = await canvasToBlob(canvas, outType);

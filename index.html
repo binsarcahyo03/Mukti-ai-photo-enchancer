@@ -55,6 +55,15 @@
         <p class="hint" id="sizeHint">Pilih foto untuk melihat ukuran hasil.</p>
       </div>
 
+      <div class="field">
+        <span class="field-label" id="styleLabel">Gaya hasil</span>
+        <div class="segmented two" role="radiogroup" aria-labelledby="styleLabel">
+          <button type="button" class="opt active" data-style="natural" role="radio" aria-checked="true">Natural</button>
+          <button type="button" class="opt" data-style="detail" role="radio" aria-checked="false">Detail maksimal</button>
+        </div>
+        <p class="hint">Natural menjaga tampilan foto asli. Detail maksimal memakai hasil AI penuh.</p>
+      </div>
+
       <button class="btn primary" id="enhanceBtn" type="button" disabled>Tingkatkan resolusi</button>
       <p class="error" id="errorBox" role="alert" hidden></p>
     </section>
