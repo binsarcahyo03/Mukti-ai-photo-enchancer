@@ -5,17 +5,18 @@
  * KEAMANAN: jangan pernah menaruh API key di file ini. Key disimpan di server
  * (environment variable) dan backend Anda yang memanggil layanan Real-ESRGAN.
  *
- * Kontrak API backend (POST multipart/form-data):
- *   field "image"  : file foto asli
- *   field "scale"  : "2" atau "4"
- *   Respons sukses : file gambar (Content-Type image/*) ATAU JSON {"url": "https://..."}
- *   Respons gagal  : status non-2xx dengan JSON {"error": "pesan"}
+ * Server Real-ESRGAN (Hugging Face Space) memakai pekerjaan asinkron:
+ *   POST {API_URL}/enhance      form: image, scale ("2" | "4" | "4k"), max_side
+ *                               -> {"job_id": "..."}
+ *   GET  {API_URL}/status/{id}  -> {"status": "queued|processing|done|error", "progress": 0..1}
+ *   GET  {API_URL}/result/{id}  -> file gambar hasil
+ *   Galat: status non-2xx dengan JSON {"detail": "pesan"}
  */
 const CONFIG = {
-  API_URL: "",          // contoh: "/api/enhance"
+  API_URL: "",          // contoh: "https://USERNAME-mukti-esrgan.hf.space" (tanpa garis miring di akhir)
   MAX_SIDE: 3840,       // batas sisi terpanjang hasil (4K UHD)
   MAX_FILE_MB: 25,
-  SHARPEN_AMOUNT: 0.35  // lembut, hanya mempertegas detail, tidak mengubah bentuk wajah
+  SHARPEN_AMOUNT: 0.8   // mempertegas detail tepi, tidak mengubah bentuk wajah
 };
 
 const ALLOWED = ["image/jpeg", "image/png", "image/webp"];
@@ -68,8 +69,11 @@ function setProgress(pct, text) {
 }
 
 function targetSize() {
-  let w = state.img.naturalWidth * state.scale;
-  let h = state.img.naturalHeight * state.scale;
+  const k4 = state.scale === "4k"
+    ? CONFIG.MAX_SIDE / Math.max(state.img.naturalWidth, state.img.naturalHeight)
+    : state.scale;
+  let w = state.img.naturalWidth * k4;
+  let h = state.img.naturalHeight * k4;
   const longest = Math.max(w, h);
   let capped = false;
   if (longest > CONFIG.MAX_SIDE) {
@@ -138,7 +142,7 @@ document.addEventListener("paste", (e) => {
 /* ---------- Pilihan 2x / 4x ---------- */
 document.querySelectorAll(".seg").forEach((btn) =>
   btn.addEventListener("click", () => {
-    state.scale = Number(btn.dataset.scale);
+    state.scale = btn.dataset.scale === "4k" ? "4k" : Number(btn.dataset.scale);
     document.querySelectorAll(".seg").forEach((b) => {
       const on = b === btn;
       b.classList.toggle("active", on);
@@ -155,49 +159,166 @@ function makeCanvas(w, h) {
   return c;
 }
 
-// Pembesaran bertahap (maks 2x per langkah) agar tepi lebih halus.
-async function stepUpscale(img, tw, th) {
-  let cur = img, cw = img.naturalWidth, ch = img.naturalHeight, canvas = null;
-  const steps = Math.max(1, Math.ceil(Math.log2(Math.max(tw / cw, th / ch))));
-  for (let i = 1; i <= steps; i++) {
-    const nw = i === steps ? tw : Math.min(tw, Math.round(cw * 2));
-    const nh = i === steps ? th : Math.min(th, Math.round(ch * 2));
-    canvas = makeCanvas(nw, nh);
-    const ctx = canvas.getContext("2d");
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(cur, 0, 0, nw, nh);
-    cur = canvas; cw = nw; ch = nh;
-    setProgress(15 + (i / steps) * 40, `Memperbesar resolusi (${i}/${steps})…`);
-    await tick();
+// Kernel Lanczos-3: resampling kualitas tinggi, jauh lebih tajam dari bilinear.
+function lanczos(x) {
+  if (x === 0) return 1;
+  if (x <= -3 || x >= 3) return 0;
+  const p = Math.PI * x;
+  return (3 * Math.sin(p) * Math.sin(p / 3)) / (p * p);
+}
+
+function lanczosWeights(srcLen, dstLen) {
+  const ratio = dstLen / srcLen;
+  const start = new Int32Array(dstLen);
+  const w = new Float32Array(dstLen * 6);
+  for (let i = 0; i < dstLen; i++) {
+    const center = (i + 0.5) / ratio - 0.5;
+    const s = Math.floor(center) - 2;
+    start[i] = s;
+    let sum = 0;
+    for (let k = 0; k < 6; k++) {
+      const v = lanczos(center - (s + k));
+      w[i * 6 + k] = v; sum += v;
+    }
+    for (let k = 0; k < 6; k++) w[i * 6 + k] /= sum;
   }
+  return { start, w };
+}
+
+// Pengurang blok JPEG ringan: hanya meratakan beda kecil, tepi tetap utuh.
+async function denoise(data, w, h, sigma) {
+  const src = new Uint8ClampedArray(data);
+  const inv = 1 / (2 * sigma * sigma);
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = (y * w + x) * 4;
+      const lc = (src[i] * 3 + src[i + 1] * 6 + src[i + 2]) / 10;
+      let r = 0, g = 0, b = 0, ws = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const j = i + (dy * w + dx) * 4;
+          const d = (src[j] * 3 + src[j + 1] * 6 + src[j + 2]) / 10 - lc;
+          const wt = Math.exp(-d * d * inv);
+          r += src[j] * wt; g += src[j + 1] * wt; b += src[j + 2] * wt; ws += wt;
+        }
+      }
+      data[i] = r / ws; data[i + 1] = g / ws; data[i + 2] = b / ws;
+    }
+    if (y % 120 === 0) await tick();
+  }
+}
+
+async function lanczosResize(img, tw, th) {
+  const sw = img.naturalWidth, sh = img.naturalHeight;
+  const c0 = makeCanvas(sw, sh);
+  const x0 = c0.getContext("2d");
+  x0.drawImage(img, 0, 0);
+  const src = x0.getImageData(0, 0, sw, sh).data;
+
+  if (sw * sh <= 4e6) {
+    setProgress(10, "Merapikan blok kompresi…");
+    await tick();
+    await denoise(src, sw, sh, 8);
+  }
+
+  const wx = lanczosWeights(sw, tw), wy = lanczosWeights(sh, th);
+
+  // Lintasan horizontal
+  const mid = new Uint8ClampedArray(tw * sh * 4);
+  for (let y = 0; y < sh; y++) {
+    const row = y * sw * 4, orow = y * tw * 4;
+    for (let x = 0; x < tw; x++) {
+      const s = wx.start[x]; let r = 0, g = 0, b = 0, a = 0;
+      for (let k = 0; k < 6; k++) {
+        let sx = s + k; sx = sx < 0 ? 0 : sx >= sw ? sw - 1 : sx;
+        const wt = wx.w[x * 6 + k], i = row + sx * 4;
+        r += src[i] * wt; g += src[i + 1] * wt; b += src[i + 2] * wt; a += src[i + 3] * wt;
+      }
+      const o = orow + x * 4;
+      mid[o] = r; mid[o + 1] = g; mid[o + 2] = b; mid[o + 3] = a;
+    }
+    if (y % 48 === 47) { setProgress(20 + (y / sh) * 20, "Memperbesar resolusi…"); await tick(); }
+  }
+
+  // Lintasan vertikal
+  const canvas = makeCanvas(tw, th);
+  const ctx = canvas.getContext("2d");
+  const out = ctx.createImageData(tw, th), od = out.data;
+  const offs = new Int32Array(6);
+  for (let y = 0; y < th; y++) {
+    const s = wy.start[y];
+    for (let k = 0; k < 6; k++) {
+      let sy = s + k; sy = sy < 0 ? 0 : sy >= sh ? sh - 1 : sy;
+      offs[k] = sy * tw * 4;
+    }
+    const wbase = y * 6, orow = y * tw * 4;
+    for (let x = 0; x < tw; x++) {
+      const xo = x * 4; let r = 0, g = 0, b = 0, a = 0;
+      for (let k = 0; k < 6; k++) {
+        const wt = wy.w[wbase + k], i = offs[k] + xo;
+        r += mid[i] * wt; g += mid[i + 1] * wt; b += mid[i + 2] * wt; a += mid[i + 3] * wt;
+      }
+      const o = orow + xo;
+      od[o] = r; od[o + 1] = g; od[o + 2] = b; od[o + 3] = a;
+    }
+    if (y % 48 === 47) { setProgress(40 + (y / th) * 25, "Memperbesar resolusi…"); await tick(); }
+  }
+  ctx.putImageData(out, 0, 0);
   return canvas;
 }
 
-// Unsharp mask lembut: hasil = asli + jumlah × (asli − blur 3×3).
-async function sharpen(canvas, amount) {
+// Blur kotak terpisah (cepat) untuk unsharp mask.
+function boxBlurRGB(s, w, h, r) {
+  const tmp = new Uint8ClampedArray(s.length), out = new Uint8ClampedArray(s.length);
+  const n = 2 * r + 1, cl = (v, m) => (v < 0 ? 0 : v > m ? m : v);
+  for (let y = 0; y < h; y++) {
+    const row = y * w * 4;
+    for (let c = 0; c < 3; c++) {
+      let sum = 0;
+      for (let k = -r; k <= r; k++) sum += s[row + cl(k, w - 1) * 4 + c];
+      for (let x = 0; x < w; x++) {
+        tmp[row + x * 4 + c] = sum / n;
+        sum += s[row + cl(x + r + 1, w - 1) * 4 + c] - s[row + cl(x - r, w - 1) * 4 + c];
+      }
+    }
+  }
+  const st = w * 4;
+  for (let x = 0; x < w; x++) {
+    for (let c = 0; c < 3; c++) {
+      let sum = 0;
+      for (let k = -r; k <= r; k++) sum += tmp[cl(k, h - 1) * st + x * 4 + c];
+      for (let y = 0; y < h; y++) {
+        out[y * st + x * 4 + c] = sum / n;
+        sum += tmp[cl(y + r + 1, h - 1) * st + x * 4 + c] - tmp[cl(y - r, h - 1) * st + x * 4 + c];
+      }
+    }
+  }
+  return out;
+}
+
+// Unsharp mask: abaikan beda sangat kecil (noise) dan batasi beda besar (halo).
+async function sharpen(canvas, amount, radius) {
   const w = canvas.width, h = canvas.height;
   const ctx = canvas.getContext("2d");
   const frame = ctx.getImageData(0, 0, w, h);
   const d = frame.data, s = new Uint8ClampedArray(d);
-  const CHUNK = 160;
-  for (let y0 = 1; y0 < h - 1; y0 += CHUNK) {
-    const y1 = Math.min(h - 1, y0 + CHUNK);
-    for (let y = y0; y < y1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        const i = (y * w + x) * 4;
-        for (let c = 0; c < 3; c++) {
-          const k = i + c;
-          const blur = (
-            s[k - w * 4 - 4] + s[k - w * 4] + s[k - w * 4 + 4] +
-            s[k - 4] + s[k] + s[k + 4] +
-            s[k + w * 4 - 4] + s[k + w * 4] + s[k + w * 4 + 4]
-          ) / 9;
-          d[k] = s[k] + amount * (s[k] - blur);
-        }
+  setProgress(72, "Mempertajam detail…");
+  await tick();
+  const b = boxBlurRGB(s, w, h, radius);
+  await tick();
+  const SOFT = 5, LIM = 40, STEP = 1600000;
+  for (let st = 0; st < d.length; st += STEP) {
+    const end = Math.min(d.length, st + STEP);
+    for (let i = st; i < end; i += 4) {
+      for (let c = 0; c < 3; c++) {
+        let diff = s[i + c] - b[i + c];
+        const a = diff < 0 ? -diff : diff;
+        if (a < SOFT) diff *= a / SOFT;
+        else if (a > LIM) diff = diff < 0 ? -LIM : LIM;
+        d[i + c] = s[i + c] + amount * diff;
       }
     }
-    setProgress(55 + (y1 / h) * 35, "Mempertajam detail…");
+    setProgress(72 + (end / d.length) * 20, "Mempertajam detail…");
     await tick();
   }
   ctx.putImageData(frame, 0, 0);
@@ -212,56 +333,95 @@ function canvasToBlob(canvas, type) {
 
 async function enhanceLocal() {
   const { w, h } = targetSize();
-  setProgress(8, "Membaca foto…");
+  const sw = state.img.naturalWidth, sh = state.img.naturalHeight;
+  setProgress(5, "Membaca foto…");
   await tick();
-  let canvas = await stepUpscale(state.img, w, h);
-  canvas = await sharpen(canvas, CONFIG.SHARPEN_AMOUNT);
+  let canvas;
+  if (w <= sw && h <= sh) {
+    canvas = makeCanvas(w, h);
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(state.img, 0, 0, w, h);
+  } else {
+    canvas = await lanczosResize(state.img, w, h);
+  }
+  canvas = await sharpen(canvas, CONFIG.SHARPEN_AMOUNT, w / sw >= 3 ? 2 : 1);
   setProgress(94, "Menyimpan hasil…");
   const outType = state.file.type === "image/jpeg" ? "image/jpeg" : "image/png";
   const blob = await canvasToBlob(canvas, outType);
   return { blob, width: w, height: h };
 }
 
-/* ---------- Mode backend Real-ESRGAN ---------- */
+/* ---------- Mode server Real-ESRGAN (Hugging Face Space) ---------- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Galat yang berasal dari server (mis. foto terlalu besar): tampilkan apa adanya, tanpa fallback.
+class ServerError extends Error {}
+
+async function serverMessage(res, fallback) {
+  try { const j = await res.json(); return j.detail || j.error || fallback; }
+  catch (_) { return fallback; }
+}
+
+// Space gratis tidur saat lama tidak dipakai; tunggu sampai /health menjawab.
+async function wakeServer(base) {
+  for (let i = 0; i < 45; i++) {
+    try {
+      const r = await fetch(base + "/health", { cache: "no-store" });
+      const j = await r.json();
+      if (j && j.ok) return;
+    } catch (_) { /* masih bangun */ }
+    setProgress(6, "Membangunkan server gratis, bisa 1–2 menit…");
+    await sleep(3000);
+  }
+  throw new Error("Server AI tidak merespons.");
+}
+
 async function enhanceRemote() {
+  const base = CONFIG.API_URL.replace(/\/+$/, "");
+  setProgress(5, "Menghubungi server…");
+  await wakeServer(base);
+
   setProgress(10, "Mengunggah foto…");
   const form = new FormData();
   form.append("image", state.file);
   form.append("scale", String(state.scale));
-
-  // Progres semu selagi menunggu server (server tidak mengirim progres).
-  let fake = 20;
-  const timer = setInterval(() => {
-    fake = Math.min(88, fake + 2);
-    setProgress(fake, "Real-ESRGAN sedang memproses…");
-  }, 700);
-
-  try {
-    const res = await fetch(CONFIG.API_URL, { method: "POST", body: form });
-    if (!res.ok) {
-      let msg = `Server menolak permintaan (${res.status}).`;
-      try { msg = (await res.json()).error || msg; } catch (_) {}
-      throw new Error(msg);
-    }
-    let blob;
-    if ((res.headers.get("content-type") || "").includes("application/json")) {
-      const { url } = await res.json();
-      if (!url) throw new Error("Respons server tidak berisi URL hasil.");
-      setProgress(92, "Mengunduh hasil…");
-      blob = await (await fetch(url)).blob();
-    } else {
-      blob = await res.blob();
-    }
-    const dims = await new Promise((resolve, reject) => {
-      const u = URL.createObjectURL(blob), im = new Image();
-      im.onload = () => { URL.revokeObjectURL(u); resolve({ width: im.naturalWidth, height: im.naturalHeight }); };
-      im.onerror = () => reject(new Error("Hasil dari server bukan gambar valid."));
-      im.src = u;
-    });
-    return { blob, ...dims };
-  } finally {
-    clearInterval(timer);
+  form.append("max_side", String(CONFIG.MAX_SIDE));
+  const res = await fetch(base + "/enhance", { method: "POST", body: form });
+  if (!res.ok) {
+    throw new ServerError(await serverMessage(res, `Server menolak permintaan (${res.status}).`));
   }
+  const { job_id } = await res.json();
+
+  for (let misses = 0; ;) {
+    await sleep(1500);
+    let st;
+    try {
+      const r = await fetch(`${base}/status/${job_id}`, { cache: "no-store" });
+      if (!r.ok) throw new Error(String(r.status));
+      st = await r.json();
+      misses = 0;
+    } catch (_) {
+      if (++misses > 8) throw new ServerError("Koneksi ke server terputus. Coba lagi.");
+      continue;
+    }
+    if (st.status === "error") throw new ServerError(st.error || "Server gagal memproses foto.");
+    if (st.status === "queued") setProgress(12, `Dalam antrean (urutan ${st.position})…`);
+    if (st.status === "processing") setProgress(15 + st.progress * 75, "Real-ESRGAN memproses…");
+    if (st.status === "done") break;
+  }
+
+  setProgress(94, "Mengunduh hasil…");
+  const r = await fetch(`${base}/result/${job_id}`);
+  if (!r.ok) throw new ServerError(await serverMessage(r, "Hasil tidak bisa diambil."));
+  const blob = await r.blob();
+  const dims = await new Promise((resolve, reject) => {
+    const u = URL.createObjectURL(blob), im = new Image();
+    im.onload = () => { URL.revokeObjectURL(u); resolve({ width: im.naturalWidth, height: im.naturalHeight }); };
+    im.onerror = () => reject(new ServerError("Hasil dari server bukan gambar valid."));
+    im.src = u;
+  });
+  return { blob, ...dims };
 }
 
 /* ---------- Jalankan proses ---------- */
@@ -276,7 +436,19 @@ el.enhanceBtn.addEventListener("click", async () => {
   el.progressCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
 
   try {
-    const out = CONFIG.API_URL ? await enhanceRemote() : await enhanceLocal();
+    let out;
+    if (CONFIG.API_URL) {
+      try {
+        out = await enhanceRemote();
+      } catch (err) {
+        if (err instanceof ServerError) throw err;
+        console.error(err);
+        setProgress(5, "Server AI tidak tersedia, memakai mode demo lokal…");
+        out = { ...(await enhanceLocal()), note: "demo lokal" };
+      }
+    } else {
+      out = await enhanceLocal();
+    }
     showResult(out);
   } catch (err) {
     console.error(err);
@@ -292,7 +464,7 @@ el.enhanceBtn.addEventListener("click", async () => {
 });
 
 /* ---------- Hasil & perbandingan ---------- */
-function showResult({ blob, width, height }) {
+function showResult({ blob, width, height, note }) {
   if (state.outURL) URL.revokeObjectURL(state.outURL);
   state.outURL = URL.createObjectURL(blob);
 
@@ -307,9 +479,9 @@ function showResult({ blob, width, height }) {
   el.cmpRange.value = 50;
   el.compare.style.setProperty("--pos", "50%");
 
-  el.resultChip.textContent = `${width} × ${height} px · ${fmtMB(blob.size)}`;
+  el.resultChip.textContent = `${width} × ${height} px · ${fmtMB(blob.size)}` + (note ? ` · ${note}` : "");
   state.outBlob = blob;
-  state.outName = `${base}-mukti-${state.scale}x.${ext}`;
+  state.outName = `${base}-mukti-${state.scale === "4k" ? "4k" : state.scale + "x"}.${ext}`;
   el.dlError.hidden = true;
   el.downloadBtn.href = state.outURL;
   el.downloadBtn.download = state.outName;
