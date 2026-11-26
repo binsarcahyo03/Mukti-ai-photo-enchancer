@@ -16,8 +16,8 @@ const CONFIG = {
   API_URL: "",          // contoh: "https://USERNAME-mukti-esrgan.hf.space" (tanpa garis miring di akhir)
   MAX_SIDE: 3840,       // batas sisi terpanjang hasil (4K UHD)
   BROWSER_AI: true,     // Real-ESRGAN dijalankan di HP/komputer pengguna (gratis, tanpa server)
-  AI_MAX_PIXELS_GPU: 1200000, // batas foto masuk jika WebGPU tersedia (sekitar 1,2 MP)
-  AI_MAX_PIXELS_CPU: 350000,  // batas foto masuk tanpa WebGPU (lebih lambat)
+  AI_MAX_PIXELS_GPU: 2500000, // piksel yang diproses AI jika WebGPU tersedia (foto lebih besar diperkecil dulu)
+  AI_MAX_PIXELS_CPU: 500000,  // piksel yang diproses AI tanpa WebGPU (lebih lambat)
   NATURAL_AI_WEIGHT: 0.7,     // gaya "Natural": 70% hasil AI + 30% foto asli
   SHARPEN_MAX_PIXELS: 6500000, // di atas ini penajaman dilewati agar tidak kehabisan memori
   MAX_FILE_MB: 25,
@@ -93,8 +93,10 @@ function updateHint() {
   const t = targetSize();
   const mp = ((t.w * t.h) / 1e6).toFixed(1);
   let msg = `Hasil: ${t.w} × ${t.h} px (${mp} MP)` + (t.capped ? ". Dibatasi 4K." : ".");
-  if (CONFIG.BROWSER_AI && !CONFIG.API_URL && state.img.naturalWidth * state.img.naturalHeight > aiCap()) {
-    msg += ` Foto ini melebihi batas AI (${(aiCap() / 1e6).toFixed(2)} MP), jadi memakai mode demo.`;
+  if (CONFIG.BROWSER_AI && !CONFIG.API_URL) {
+    const f = Math.sqrt(aiCap() / (state.img.naturalWidth * state.img.naturalHeight));
+    if (f < 0.375) msg += " Foto sudah beresolusi besar, jadi memakai mode demo.";
+    else if (f < 1) msg += " Foto besar: AI memproses versi yang lebih kecil agar lebih cepat.";
   }
   el.sizeHint.textContent = msg;
 }
@@ -527,15 +529,18 @@ async function blendWithOriginal(canvas, base, aiWeight) {
 }
 
 async function runAI(ai) {
-  const sw = state.img.naturalWidth, sh = state.img.naturalHeight;
+  const ow = state.img.naturalWidth, oh = state.img.naturalHeight;
   const cap = ai.backend === "webgpu" ? CONFIG.AI_MAX_PIXELS_GPU : CONFIG.AI_MAX_PIXELS_CPU;
-  if (sw * sh > cap) {
-    throw noteError("Foto melebihi batas AI.", `demo lokal, batas AI ${(cap / 1e6).toFixed(2)} MP`);
+  // Foto besar: AI memproses versi yang lebih kecil agar cepat dan hemat memori.
+  const f = Math.min(1, Math.sqrt(cap / (ow * oh)));
+  if (f < 0.375) {
+    throw noteError("Foto sudah besar.", "demo lokal, foto sudah beresolusi besar");
   }
-  const c0 = makeCanvas(sw, sh);
-  const x0 = c0.getContext("2d");
-  x0.drawImage(state.img, 0, 0);
-  const src = x0.getImageData(0, 0, sw, sh).data;
+  const c0 = makeCanvas(ow, oh);
+  c0.getContext("2d").drawImage(state.img, 0, 0);
+  const sw = f < 1 ? Math.round(ow * f) : ow, sh = f < 1 ? Math.round(oh * f) : oh;
+  const small = f < 1 ? resizeSteps(c0, sw, sh) : c0;
+  const src = small.getContext("2d").getImageData(0, 0, sw, sh).data;
   for (let i = 3; i < src.length; i += 4) {
     if (src[i] < 255) throw noteError("Foto transparan.", "demo lokal, foto transparan");
   }
@@ -545,9 +550,12 @@ async function runAI(ai) {
     const res = await ai.session.run({ [inName]: new ort.Tensor("float32", buf, [1, 3, P, P]) });
     return res[outName].data;
   };
-  const out = await aiUpscaleRGBA(src, sw, sh, runTile, (f) =>
-    setProgress(14 + f * 76, "Real-ESRGAN memproses…")
-  );
+  const t0 = performance.now();
+  const out = await aiUpscaleRGBA(src, sw, sh, runTile, (p) => {
+    const rest = p > 0.03 ? ((performance.now() - t0) / 1000 / p) * (1 - p) : 0;
+    const eta = rest > 90 ? `±${Math.round(rest / 60)} menit` : `±${Math.round(rest)} detik`;
+    setProgress(14 + p * 76, "Real-ESRGAN memproses…" + (rest > 8 ? ` sisa ${eta}` : ""));
+  });
 
   setProgress(91, "Menyusun hasil…");
   await tick();
