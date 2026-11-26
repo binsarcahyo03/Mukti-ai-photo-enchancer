@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d0f0b">
+  <title>MUKTI AI Photo Enhancer</title>
+  <meta name="description" content="Tingkatkan resolusi foto hingga 4K dengan Real-ESRGAN tanpa mengubah wajah asli.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#" aria-label="MUKTI AI Photo Enhancer">
+      <span class="brand-mark" aria-hidden="true">M</span>
+      <span class="brand-name">MUKTI <small>AI Photo Enhancer</small></span>
+    </a>
+    <span class="mode-badge" id="modeBadge">Mode demo lokal</span>
+  </header>
+
+  <main class="wrap">
+    <section class="hero">
+      <h1>Foto kecil jadi tajam hingga 4K, wajah tetap wajah aslinya.</h1>
+      <p>Peningkatan resolusi dengan Real-ESRGAN. Tanpa filter kecantikan, tanpa mengubah bentuk wajah.</p>
+    </section>
+
+    <!-- Langkah 1: unggah -->
+    <section class="card" id="uploadCard">
+      <label class="dropzone" id="dropzone" for="fileInput">
+        <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" hidden>
+        <div class="dz-empty" id="dzEmpty">
+          <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+          <strong>Pilih foto atau seret ke sini</strong>
+          <span>JPG, JPEG, PNG, WEBP. Maksimal 25 MB.</span>
+        </div>
+        <div class="dz-preview" id="dzPreview" hidden>
+          <img id="previewImg" alt="Pratinjau foto yang dipilih">
+          <div class="dz-meta">
+            <strong id="fileName">-</strong>
+            <span id="fileInfo">-</span>
+            <span class="link">Ganti foto</span>
+          </div>
+        </div>
+      </label>
+
+      <div class="field">
+        <span class="field-label" id="scaleLabel">Perbesaran</span>
+        <div class="segmented" role="radiogroup" aria-labelledby="scaleLabel">
+          <button type="button" class="seg active" data-scale="2" role="radio" aria-checked="true">2x</button>
+          <button type="button" class="seg" data-scale="4" role="radio" aria-checked="false">4x</button>
+        </div>
+        <p class="hint" id="sizeHint">Pilih foto untuk melihat ukuran hasil.</p>
+      </div>
+
+      <button class="btn primary" id="enhanceBtn" type="button" disabled>Tingkatkan resolusi</button>
+      <p class="error" id="errorBox" role="alert" hidden></p>
+    </section>
+
+    <!-- Langkah 2: proses -->
+    <section class="card" id="progressCard" hidden aria-live="polite">
+      <div class="progress-head">
+        <strong id="progressText">Menyiapkan…</strong>
+        <span id="progressPct">0%</span>
+      </div>
+      <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="bar">
+        <div class="bar-fill" id="barFill"></div>
+      </div>
+      <p class="hint">Jangan tutup halaman ini. Foto besar bisa memakan beberapa detik di HP.</p>
+    </section>
+
+    <!-- Langkah 3: hasil -->
+    <section class="card" id="resultCard" hidden>
+      <div class="result-head">
+        <h2>Hasil</h2>
+        <span class="chip" id="resultChip">-</span>
+      </div>
+
+      <div class="compare" id="compare">
+        <img class="cmp-after" id="afterImg" alt="Foto sesudah ditingkatkan">
+        <div class="cmp-before" id="beforeLayer">
+          <img id="beforeImg" alt="Foto sebelum ditingkatkan">
+        </div>
+        <span class="tag tag-l">Sebelum</span>
+        <span class="tag tag-r">Sesudah</span>
+        <div class="cmp-handle" id="handle" aria-hidden="true"><i></i></div>
+        <input type="range" class="cmp-range" id="cmpRange" min="0" max="100" value="50" aria-label="Geser untuk membandingkan sebelum dan sesudah">
+      </div>
+
+      <p class="error" id="dlError" role="alert" hidden></p>
+      <div class="actions">
+        <a class="btn primary" id="downloadBtn" download>Unduh hasil</a>
+        <button class="btn ghost" id="resetBtn" type="button">Foto baru</button>
+      </div>
+    </section>
+
+    <section class="notes">
+      <h2>Tentang hasil foto</h2>
+      <ul>
+        <li>Fokus pada ketajaman dan detail, bukan memperhalus kulit atau mengubah bentuk wajah.</li>
+        <li>Foto diproses di perangkat Anda pada mode demo. Tidak ada yang dikirim ke server.</li>
+        <li>Untuk kualitas Real-ESRGAN penuh, hubungkan backend melalui <code>CONFIG.API_URL</code> di script.js.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="foot">MUKTI AI Photo Enhancer</footer>
+  <script src="script.js"></script>
+</body>
