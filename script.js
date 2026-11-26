@@ -15,6 +15,9 @@
 const CONFIG = {
   API_URL: "",          // contoh: "https://USERNAME-mukti-esrgan.hf.space" (tanpa garis miring di akhir)
   MAX_SIDE: 3840,       // batas sisi terpanjang hasil (4K UHD)
+  BROWSER_AI: true,     // Real-ESRGAN dijalankan di HP/komputer pengguna (gratis, tanpa server)
+  AI_MAX_PIXELS_GPU: 1200000, // batas foto masuk jika WebGPU tersedia (sekitar 1,2 MP)
+  AI_MAX_PIXELS_CPU: 350000,  // batas foto masuk tanpa WebGPU (lebih lambat)
   MAX_FILE_MB: 25,
   SHARPEN_AMOUNT: 0.8   // mempertegas detail tepi, tidak mengubah bentuk wajah
 };
@@ -46,8 +49,8 @@ if (!el.dlError) {
 
 const state = { file: null, img: null, srcURL: null, outURL: null, scale: 2, busy: false };
 
-if (CONFIG.API_URL) {
-  el.modeBadge.textContent = "Real-ESRGAN aktif";
+if (CONFIG.API_URL || CONFIG.BROWSER_AI) {
+  el.modeBadge.textContent = CONFIG.API_URL ? "Real-ESRGAN (server)" : "Real-ESRGAN di perangkat";
   el.modeBadge.classList.add("live");
 }
 
@@ -87,7 +90,11 @@ function updateHint() {
   if (!state.img) return;
   const t = targetSize();
   const mp = ((t.w * t.h) / 1e6).toFixed(1);
-  el.sizeHint.textContent = `Hasil: ${t.w} × ${t.h} px (${mp} MP)` + (t.capped ? ". Dibatasi 4K." : ".");
+  let msg = `Hasil: ${t.w} × ${t.h} px (${mp} MP)` + (t.capped ? ". Dibatasi 4K." : ".");
+  if (CONFIG.BROWSER_AI && !CONFIG.API_URL && state.img.naturalWidth * state.img.naturalHeight > aiCap()) {
+    msg += ` Foto ini melebihi batas AI (${(aiCap() / 1e6).toFixed(2)} MP), jadi memakai mode demo.`;
+  }
+  el.sizeHint.textContent = msg;
 }
 
 /* ---------- Pilih file ---------- */
@@ -352,6 +359,181 @@ async function enhanceLocal() {
   return { blob, width: w, height: h };
 }
 
+/* ---------- Mode AI di perangkat (Real-ESRGAN via ONNX Runtime Web) ---------- */
+// Model realesr-general-x4v3 (resmi Real-ESRGAN, ~5 MB) berjalan di browser pengguna.
+// Tanpa server dan tanpa biaya. Tidak memakai face enhance, jadi wajah tidak dirombak.
+const ORT_VER = "1.20.1";
+const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
+const MODELS = {
+  webgpu: [
+    "https://huggingface.co/vlad-grig/realesr-general-x4v3-onnx/resolve/main/onnx/model_fp16.onnx",
+    "https://huggingface.co/skillsafe-ai/realesr-general-x4v3/resolve/main/model_fp16.onnx"
+  ],
+  wasm: [
+    "model/realesr-general-x4v3.onnx", // opsional: taruh file model sendiri di folder model/
+    "https://huggingface.co/vlad-grig/realesr-general-x4v3-onnx/resolve/main/onnx/model.onnx",
+    "https://huggingface.co/skillsafe-ai/realesr-general-x4v3/resolve/main/model.onnx",
+    "https://huggingface.co/Heliosoph/realesrgan-onnx/resolve/main/realesr-general-x4v3.onnx"
+  ]
+};
+const AI = { session: null, backend: null };
+
+function aiCap() {
+  return navigator.gpu ? CONFIG.AI_MAX_PIXELS_GPU : CONFIG.AI_MAX_PIXELS_CPU;
+}
+
+function noteError(msg, note) {
+  const e = new Error(msg);
+  e.note = note;
+  return e;
+}
+
+function loadScript(url) {
+  return new Promise((resolve, reject) => {
+    if (window.ort) return resolve();
+    const sc = document.createElement("script");
+    sc.src = url;
+    sc.onload = resolve;
+    sc.onerror = () => reject(new Error("Pustaka AI gagal dimuat."));
+    document.head.appendChild(sc);
+  });
+}
+
+async function fetchModel(urls) {
+  for (const u of urls) {
+    try {
+      const r = await fetch(u);
+      if (!r.ok) continue;
+      const buf = await r.arrayBuffer();
+      if (buf.byteLength > 1e6) return new Uint8Array(buf);
+    } catch (_) { /* coba alamat berikutnya */ }
+  }
+  throw new Error("Model AI tidak bisa diunduh.");
+}
+
+async function loadAI(forceWasm) {
+  if (AI.session && (!forceWasm || AI.backend === "wasm")) return AI;
+  setProgress(6, "Memuat mesin AI…");
+  await loadScript(ORT_BASE + "ort.webgpu.min.js");
+  ort.env.wasm.wasmPaths = ORT_BASE;
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+  const order = navigator.gpu && !forceWasm ? ["webgpu", "wasm"] : ["wasm"];
+  for (const ep of order) {
+    try {
+      setProgress(9, "Mengunduh model AI (sekitar 5 MB, sekali saja)…");
+      const model = await fetchModel(MODELS[ep]);
+      setProgress(11, "Menyiapkan model…");
+      AI.session = await ort.InferenceSession.create(model, { executionProviders: [ep] });
+      AI.backend = ep;
+      return AI;
+    } catch (e) {
+      console.warn("Backend AI gagal:", ep, e);
+    }
+  }
+  throw new Error("Model AI gagal dimuat.");
+}
+
+// Memproses foto per petak 128 px (+ tepi 10 px) agar hemat memori. Setiap petak
+// berukuran sama, jadi model tidak perlu dikompilasi ulang. Keluaran: RGBA 4x.
+async function aiUpscaleRGBA(src, sw, sh, runTile, onTile) {
+  const T = 128, PAD = 10, P = T + 2 * PAD, S = 4, OW = P * S;
+  const outW = sw * S, outH = sh * S;
+  const out = new Uint8ClampedArray(outW * outH * 4);
+  const plane = P * P, oplane = OW * OW;
+  const total = Math.ceil(sw / T) * Math.ceil(sh / T);
+  let n = 0;
+  for (let ty = 0; ty < sh; ty += T) {
+    for (let tx = 0; tx < sw; tx += T) {
+      const buf = new Float32Array(3 * plane);
+      for (let y = 0; y < P; y++) {
+        let sy = ty - PAD + y; sy = sy < 0 ? 0 : sy >= sh ? sh - 1 : sy;
+        for (let x = 0; x < P; x++) {
+          let sx = tx - PAD + x; sx = sx < 0 ? 0 : sx >= sw ? sw - 1 : sx;
+          const i = (sy * sw + sx) * 4, o = y * P + x;
+          buf[o] = src[i] / 255;
+          buf[plane + o] = src[i + 1] / 255;
+          buf[2 * plane + o] = src[i + 2] / 255;
+        }
+      }
+      const res = await runTile(buf, P);
+      const vw = Math.min(T, sw - tx) * S, vh = Math.min(T, sh - ty) * S;
+      for (let y = 0; y < vh; y++) {
+        const ro = (PAD * S + y) * OW + PAD * S;
+        const dst = ((ty * S + y) * outW + tx * S) * 4;
+        for (let x = 0; x < vw; x++) {
+          const d = dst + x * 4;
+          out[d] = res[ro + x] * 255;
+          out[d + 1] = res[oplane + ro + x] * 255;
+          out[d + 2] = res[2 * oplane + ro + x] * 255;
+          out[d + 3] = 255;
+        }
+      }
+      onTile(++n / total);
+      await tick();
+    }
+  }
+  return out;
+}
+
+async function runAI(ai) {
+  const sw = state.img.naturalWidth, sh = state.img.naturalHeight;
+  const cap = ai.backend === "webgpu" ? CONFIG.AI_MAX_PIXELS_GPU : CONFIG.AI_MAX_PIXELS_CPU;
+  if (sw * sh > cap) {
+    throw noteError("Foto melebihi batas AI.", `demo lokal, batas AI ${(cap / 1e6).toFixed(2)} MP`);
+  }
+  const c0 = makeCanvas(sw, sh);
+  const x0 = c0.getContext("2d");
+  x0.drawImage(state.img, 0, 0);
+  const src = x0.getImageData(0, 0, sw, sh).data;
+  for (let i = 3; i < src.length; i += 4) {
+    if (src[i] < 255) throw noteError("Foto transparan.", "demo lokal, foto transparan");
+  }
+
+  const inName = ai.session.inputNames[0], outName = ai.session.outputNames[0];
+  const runTile = async (buf, P) => {
+    const res = await ai.session.run({ [inName]: new ort.Tensor("float32", buf, [1, 3, P, P]) });
+    return res[outName].data;
+  };
+  const out = await aiUpscaleRGBA(src, sw, sh, runTile, (f) =>
+    setProgress(14 + f * 76, "Real-ESRGAN memproses…")
+  );
+
+  setProgress(92, "Menyusun hasil…");
+  await tick();
+  const aw = sw * 4, ah = sh * 4;
+  const big = makeCanvas(aw, ah);
+  big.getContext("2d").putImageData(new ImageData(out, aw, ah), 0, 0);
+
+  const { w, h } = targetSize();
+  let canvas = big;
+  if (w !== aw || h !== ah) {
+    canvas = makeCanvas(w, h);
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(big, 0, 0, w, h);
+    if (w > aw) canvas = await sharpen(canvas, 0.4, 2); // di atas 4x: sedikit penajaman
+  }
+  setProgress(97, "Menyimpan hasil…");
+  const outType = state.file.type === "image/jpeg" ? "image/jpeg" : "image/png";
+  const blob = await canvasToBlob(canvas, outType);
+  return { blob, width: w, height: h, note: "Real-ESRGAN" };
+}
+
+async function enhanceAI(forceWasm = false) {
+  const ai = await loadAI(forceWasm);
+  try {
+    return await runAI(ai);
+  } catch (err) {
+    // WebGPU kadang gagal di perangkat tertentu: ulangi dengan WASM.
+    if (ai.backend === "webgpu" && !forceWasm && !err.note) {
+      console.warn("WebGPU gagal, beralih ke WASM:", err);
+      AI.session = null;
+      return enhanceAI(true);
+    }
+    throw err;
+  }
+}
+
 /* ---------- Mode server Real-ESRGAN (Hugging Face Space) ---------- */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -445,6 +627,14 @@ el.enhanceBtn.addEventListener("click", async () => {
         console.error(err);
         setProgress(5, "Server AI tidak tersedia, memakai mode demo lokal…");
         out = { ...(await enhanceLocal()), note: "demo lokal" };
+      }
+    } else if (CONFIG.BROWSER_AI) {
+      try {
+        out = await enhanceAI();
+      } catch (err) {
+        console.error(err);
+        setProgress(10, "Memakai mode demo lokal…");
+        out = { ...(await enhanceLocal()), note: err.note || "demo lokal, AI gagal dimuat" };
       }
     } else {
       out = await enhanceLocal();
